@@ -113,7 +113,16 @@ impl OpDb {
 
     // ***** Serious utilities
 
-    fn branch_contains_version(&self, target: Order, branch: &[Order], at_id: Option<&DocId>) -> bool {
+
+    fn branch_contains_version(&self, target: Order, branch: &[Order]) -> bool {
+        self.raw_branch_contains_version(target, branch, None)
+    }
+
+    fn branch_contains_doc_version(&self, target: Order, branch: &[Order], at_id: &DocId) -> bool {
+        self.raw_branch_contains_version(target, branch, Some(at_id))
+    }
+
+    fn raw_branch_contains_version(&self, target: Order, branch: &[Order], at_id: Option<&DocId>) -> bool {
         if DEEP_CHECK && at_id.is_some() {
             // When we're in document mode, all operations named in the branch must
             // contain an operation modifying the document ID.
@@ -229,16 +238,16 @@ impl OpDb {
         // Check the operation fits. The operation should not be in the branch, but
         // all the operation's parents should be.
         // println!("bcv {:?} {:?}", order, branch);
-        assert!(!self.branch_contains_version(order, branch, None));
+        assert!(!self.branch_contains_version(order, branch));
         for &parent in op.parents.iter() {
-            assert!(self.branch_contains_version(parent, branch, None));
+            assert!(self.branch_contains_version(parent, branch));
         }
 
         // Every version named by branch is either:
         // - Equal to a branch in the new operation's parents (in which case remove it)
         // - Or newer than a branch in the operation's parents (in which case keep it)
         // If there were any versions which are older, we would have aborted above.
-        let mut b: Vec<Order> = branch.iter().filter(|o| op.parents.contains(o))
+        let mut b: Vec<Order> = branch.iter().filter(|o| !op.parents.contains(o))
             .copied().collect();
         b.push(order);
         b
@@ -299,7 +308,7 @@ impl ViewDb {
                     if !exists {
                         let doc_branch: Vec<Order> = prev_vals.iter()
                             .map(|v| v.order).collect();
-                        assert!(ops.branch_contains_version(*p, &doc_branch[..], Some(&doc_op.id)));
+                        assert!(ops.branch_contains_doc_version(*p, &doc_branch[..], &doc_op.id));
                     }
                 }
             }
@@ -324,6 +333,68 @@ impl ViewDb {
             // *self.docs.get_mut(&doc_op.id).unwrap() = new_vals;
 
             // TODO: And update listeners.
+        }
+    }
+
+    fn apply_backwards(&mut self, ops: &OpDb, order: Order) {
+        let op = ops.operation_by_order(order);
+        // let prev_branch = self.branch;
+
+        // Remove the operation from the branch.
+        // TODO: Consider adding a dedicated method for this for symmetry with advance_branch_by_op.
+        let branch = &mut self.branch;
+        let this_idx = branch.iter().position(|o| *o == order).unwrap();
+        let new_len = branch.len() - 1;
+        if this_idx < new_len {
+            branch[this_idx] = branch[new_len];
+        }
+        branch.truncate(new_len);
+
+        // Add operations from the parents back.
+        for p in &op.parents {
+            if !ops.branch_contains_version(*p, &branch[..]) {
+                branch.push(*p);
+            }
+        }
+
+        // And update the data
+        for doc_op in &op.doc_ops {
+            let prev_vals = self.get_cloned(&doc_op.id);
+
+            // The values should instead contain:
+            // - Everything in prev_vals not including op.version
+            // - All the objects named in parents that aren't superseded by another
+            //   document version
+
+            // Remove this operation's contribution to the value.
+            // TODO: Also a lot of allocation going on here!
+            let mut new_vals: DbValue = prev_vals.into_iter()
+                .filter(|v| v.order != order).collect();
+            let doc_branch: Vec<Order> = new_vals.iter().map(|v| v.order).collect();
+
+            // And add back all the parents that aren't dominated by another value already.
+            for p in &doc_op.parents {
+                if !ops.branch_contains_doc_version(*p, &doc_branch[..], &doc_op.id) {
+                    if *p == ROOT_ORDER {
+                        // If all we have is the root, we'll delete the key.
+                        assert!(new_vals.is_empty());
+                    } else {
+                        let parent_op = ops.operation_by_order(*p);
+                        let parent_docop = doc_op_entry(&parent_op.doc_ops[..], &doc_op.id).unwrap();
+                        new_vals.push(DbValueSingle {
+                            order: *p,
+                            value: parent_docop.patch.clone()
+                        });
+                    }
+                }
+            }
+
+            // This is a bit dirty. We don't want to store any value if its just the root.
+            if new_vals.is_empty() {
+                self.docs.remove(&doc_op.id);
+            } else {
+                self.docs.insert(doc_op.id.clone(), new_vals);
+            }
         }
     }
 }
@@ -354,9 +425,15 @@ fn main() {
     let order = opdb.add_operation(&op);
     view.apply_forwards(&opdb, order);
 
+    println!("---------");
     println!("Ops: {:?}", opdb);
     println!("View: {:?}", view);
     println!("Doc: {:?}", view.get_cloned(&"hi".to_string()));
 
+    view.apply_backwards(&opdb, order);
 
+    println!("---------");
+    println!("Ops: {:?}", opdb);
+    println!("View: {:?}", view);
+    println!("Doc: {:?}", view.get_cloned(&"hi".to_string()));
 }
