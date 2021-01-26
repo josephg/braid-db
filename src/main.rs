@@ -1,8 +1,15 @@
 mod types;
 
+use async_std::prelude::*;
+use tide::{Request, Result, Response, StatusCode};
+
 use std::collections::{BTreeMap, BTreeSet};
 use crate::types::*;
 use crate::types::DocValue::Blob;
+use std::io;
+use std::sync::Arc;
+use async_std::sync::RwLock;
+use std::rc::Rc;
 
 // trait RawDb {
 //     type Txn;
@@ -13,12 +20,6 @@ use crate::types::DocValue::Blob;
 // }
 
 
-// thread_local! {
-//     static ROOT_VERSION: RemoteVersion = RemoteVersion {
-//         agent: "ROOT".to_string(),
-//         seq: Seq::MAX
-//     };
-// }
 const ROOT_AGENT: Agent = Agent::MAX;
 const ROOT_ORDER: Order = Order::MAX;
 const ROOT_VERSION: Version = Version {
@@ -31,7 +32,7 @@ const DEEP_CHECK: bool = true;
 #[derive(Debug)]
 struct OpDb {
     // At some point I'll need to merge everything into one kv map but for now
-    // this'll keep things a bit simpler.
+    // this will keep things a bit simpler.
     // ops: BTreeMap<Order, ()>,
     ops: Vec<LocalOperation>,
 
@@ -49,11 +50,6 @@ struct ViewDb {
     branch: Vec<Order>,
     docs: BTreeMap<DocId, DbValue>,
 }
-
-// struct MemDb {
-//     ops: OpDb,
-//     view: ViewDb,
-// }
 
 fn entry_before<'a, K: Ord, V>(map: &'a BTreeMap<K, V>, key: &K) -> Option<&'a K> {
     let mut iter = map.range(..key);
@@ -399,13 +395,46 @@ impl ViewDb {
     }
 }
 
-fn main() {
-    let mut opdb = OpDb::new();
-    let mut view = ViewDb::new();
 
-    println!("Ops: {:?}", opdb);
-    println!("View: {:?}", view);
-    println!("Doc: {:?}", view.get_cloned(&"hi".to_string()));
+#[derive(Debug)]
+struct MemDb {
+    op_db: OpDb,
+    view: ViewDb,
+}
+
+impl MemDb {
+    fn new() -> Self {
+        MemDb {
+            op_db: OpDb::new(),
+            view: ViewDb::new()
+        }
+    }
+
+    fn apply_and_advance(&mut self, op: &RemoteOperation) -> Order {
+        let order = self.op_db.add_operation(&op);
+        self.view.apply_forwards(&self.op_db, order);
+        order
+    }
+}
+
+
+impl DocValue {
+    fn to_bytes(&self) -> &[u8] {
+        match self {
+            DocValue::None => "None".as_bytes(),
+            DocValue::Blob(bytes) => &bytes[..]
+        }
+    }
+}
+
+fn main() -> io::Result<()> {
+    // let mut op_db = OpDb::new();
+    // let mut view = ViewDb::new();
+
+    let mut db = MemDb::new();
+
+    println!("Db: {:?}", db);
+    println!("Doc: {:?}", db.view.get_cloned(&"hi".to_string()));
 
 
     let op = RemoteOperation {
@@ -417,23 +446,84 @@ fn main() {
         parents: vec!(ROOT_VERSION),
         doc_ops: vec!(RemoteDocOp {
             id: "hi".to_string(),
-            patch: Blob(vec!(1,2,3)),
+            patch: Blob("hi there".as_bytes().to_vec()),
             parents: vec!(ROOT_VERSION)
         })
     };
 
-    let order = opdb.add_operation(&op);
-    view.apply_forwards(&opdb, order);
+    db.apply_and_advance(&op);
+    // let order = db.op_db.add_operation(&op);
+    // db.view.apply_forwards(&db.op_db, order);
 
     println!("---------");
-    println!("Ops: {:?}", opdb);
-    println!("View: {:?}", view);
-    println!("Doc: {:?}", view.get_cloned(&"hi".to_string()));
+    println!("Db: {:?}", db);
+    println!("Doc: {:?}", db.view.get_cloned(&"hi".to_string()));
 
-    view.apply_backwards(&opdb, order);
+    // view.apply_backwards(&op_db, order);
+    //
+    // println!("---------");
+    // println!("Db: {:?}", db);
+    // println!("Doc: {:?}", view.get_cloned(&"hi".to_string()));
 
-    println!("---------");
-    println!("Ops: {:?}", opdb);
-    println!("View: {:?}", view);
-    println!("Doc: {:?}", view.get_cloned(&"hi".to_string()));
+    // let state = Arc::new(db);
+    let state = Arc::new(RwLock::new(db));
+    // let doc = state.view.get_cloned(&"hi".to_string());
+    // println!("doc {:?}", doc);
+
+    let mut app = tide::with_state(state);
+    app.at("/doc/:key").get(|req: Request<Arc<RwLock<MemDb>>>| async move {
+        let key = req.param("key")?;
+        let doc = req.state().read().await.view.get_cloned(&key.to_string());
+        // println!("doc {:?}", doc);
+
+        if doc.len() == 1 {
+            Ok(Response::builder(StatusCode::Ok)
+                .content_type("text/plain")
+                .body(doc[0].value.to_bytes())
+                .build())
+        } else {
+            Ok(Response::from("waaah"))
+        }
+    });
+
+    app.at("/doc/:key").put(|mut req: Request<Arc<RwLock<MemDb>>>| async move {
+        let content = req.body_bytes().await?;
+        let key = req.param("key")?;
+
+        // We're stuck using agent 0.
+        let mut state = req.state().write().await;
+        let succeeds = state.op_db.max_seq(0);
+        let seq = match succeeds {
+            None => 0,
+            Some(i) => i + 1
+        };
+        let doc_succeeds: Vec<Version> = state.view.get_cloned(&key.to_string())
+            .iter()
+            .map(|v| v.order)
+            .map(|order| state.op_db.order_to_version(order))
+            .cloned()
+            .collect();
+        let parents: Vec<Version> = state.view.branch.iter()
+            .map(|order| state.op_db.order_to_version(*order)).cloned().collect();
+
+        let op = RemoteOperation {
+            version: Version { agent: 0, seq },
+            succeeds,
+            parents,
+            doc_ops: vec!(RemoteDocOp {
+                id: key.to_string(),
+                patch: Blob(content),
+                parents: doc_succeeds
+            })
+        };
+
+        let order = state.apply_and_advance(&op);
+        let version = state.op_db.order_to_version(order);
+
+        Ok(Response::from("ok"))
+    });
+
+    async_std::task::block_on(async {
+        app.listen("0.0.0.0:4000").await
+    })
 }
