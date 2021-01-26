@@ -1,15 +1,16 @@
 mod types;
+mod version;
 
 use async_std::prelude::*;
-use tide::{Request, Result, Response, StatusCode};
+use tide::{Request, Response, StatusCode};
 
 use std::collections::{BTreeMap, BTreeSet};
 use crate::types::*;
 use crate::types::DocValue::Blob;
+use crate::version::{AgentMap, ROOT_AGENT_STR};
 use std::io;
 use std::sync::Arc;
 use async_std::sync::RwLock;
-use std::rc::Rc;
 
 // trait RawDb {
 //     type Txn;
@@ -22,15 +23,18 @@ use std::rc::Rc;
 
 const ROOT_AGENT: Agent = Agent::MAX;
 const ROOT_ORDER: Order = Order::MAX;
-const ROOT_VERSION: Version = Version {
+const ROOT_VERSION: LocalVersion = LocalVersion {
     agent: ROOT_AGENT,
     seq: 0
 };
 
 const DEEP_CHECK: bool = true;
 
+
 #[derive(Debug)]
 struct OpDb {
+    agent_map: AgentMap,
+
     // At some point I'll need to merge everything into one kv map but for now
     // this will keep things a bit simpler.
     // ops: BTreeMap<Order, ()>,
@@ -38,7 +42,7 @@ struct OpDb {
 
     // Ugh, I can't use this because btreemap has no way to
     // version_to_order: BTreeMap<RemoteVersion, ()>,
-    version_to_order: BTreeMap<Version, Order>,
+    version_to_order: BTreeMap<LocalVersion, Order>,
     // map: BTreeMap<Vec<u8>, Vec<u8>>
 
     // For easy syncing. This only moves forward!
@@ -60,13 +64,22 @@ fn doc_op_entry<'a>(entries: &'a[LocalDocOp], needle: &DocId) -> Option<&'a Loca
     entries.iter().find(|doc_op| &doc_op.id == needle)
 }
 
-impl OpDb {
-    fn new() -> Self {
+
+
+impl Default for OpDb {
+    fn default() -> Self {
         OpDb {
+            agent_map: AgentMap::new(),
             version_to_order: BTreeMap::new(),
             ops: Vec::new(),
             frontier: vec!(ROOT_ORDER)
         }
+    }
+}
+
+impl OpDb {
+    fn new() -> Self {
+        Self::default()
     }
 
     /**
@@ -74,7 +87,7 @@ impl OpDb {
      * agent is not known in the database.
      */
     fn max_seq(&self, agent: Agent) -> Option<Seq> {
-        let end = Version {agent, seq: Seq::MAX};
+        let end = LocalVersion {agent, seq: Seq::MAX};
         entry_before(&self.version_to_order, &end)
         .and_then(|v| {
             if v.agent == agent {Some(v.seq)} else {None}
@@ -88,23 +101,37 @@ impl OpDb {
     }
 
     /** Fetch the operation with the specified remote version */
-    fn operation_by_version(&self, version: &Version) -> Option<&LocalOperation> {
+    fn operation_by_version(&self, version: &LocalVersion) -> Option<&LocalOperation> {
         self.version_to_order(version)
         .map(|order| self.operation_by_order(order))
     }
 
-    fn version_to_order(&self, version: &Version) -> Option<Order> {
+    fn version_to_order(&self, version: &LocalVersion) -> Option<Order> {
         if version.agent == ROOT_AGENT { Some(ROOT_ORDER) }
         else {
             self.version_to_order.get(version).cloned()
         }
     }
 
-    fn order_to_version(&self, order: Order) -> &Version {
+    fn remote_version_to_order_mut(&mut self, version: &RemoteVersion) -> Option<Order> {
+        let local = version.to_local_mut(&mut self.agent_map);
+        self.version_to_order(&local)
+    }
+
+    fn remote_version_to_order(&self, version: &RemoteVersion) -> Option<Order> {
+        let local = version.try_to_local(&self.agent_map).unwrap();
+        self.version_to_order(&local)
+    }
+
+    fn order_to_version(&self, order: Order) -> &LocalVersion {
         if order == ROOT_ORDER { &ROOT_VERSION }
         else {
             &self.operation_by_order(order).version
         }
+    }
+
+    fn order_to_remote_version(&self, order: Order) -> RemoteVersion {
+        self.order_to_version(order).to_remote(&self.agent_map)
     }
 
     // ***** Serious utilities
@@ -185,15 +212,17 @@ impl OpDb {
     /** Add an operation into the operation database. */
     fn add_operation(&mut self, op: &RemoteOperation) -> Order {
         assert!(op.parents.len() > 0, "Operation parents field must not be empty");
+        let local_version = op.version.to_local_mut(&mut self.agent_map);
 
-        if let Some(&order) = self.version_to_order.get(&op.version) {
+        if let Some(&order) = self.version_to_order.get(&local_version) {
             // The operation is already in the database.
             return order;
         }
 
         // Check that all of this operation's parents are already present.
+        // println!("inserting {:?}", op);
         let parent_orders = op.parents.iter().map(|v| {
-            self.version_to_order(v)
+            self.remote_version_to_order_mut(v)
                 .expect("Operation's parent missing in op db")
         }).collect();
 
@@ -202,17 +231,17 @@ impl OpDb {
 
         let local_op = LocalOperation {
             order: new_order,
-            version: op.version.clone(),
+            version: local_version,
             parents: parent_orders,
             doc_ops: op.doc_ops.iter().map(|doc_op| LocalDocOp {
                 id: doc_op.id.clone(),
                 parents: doc_op.parents.iter().map(|v| {
-                   self.version_to_order(&v).expect("Docop parent missing")
+                   self.remote_version_to_order_mut(&v).expect("Docop parent missing")
                 }).collect(),
                 patch: doc_op.patch.clone(),
             }).collect(),
-            succeeds: op.succeeds.map(|seq| self.version_to_order(&Version {
-                agent: op.version.agent,
+            succeeds: op.succeeds.map(|seq| self.version_to_order(&LocalVersion {
+                agent: local_version.agent,
                 seq
             }).expect("Predecessor missing in database"))
         };
@@ -222,7 +251,7 @@ impl OpDb {
 
         // And save the new operation in the store.
         self.ops.push(local_op);
-        self.version_to_order.insert(op.version, new_order);
+        self.version_to_order.insert(local_version, new_order);
 
         new_order
     }
@@ -250,12 +279,18 @@ impl OpDb {
     }
 }
 
-impl ViewDb {
-    fn new() -> Self {
+impl Default for ViewDb {
+    fn default() -> Self {
         ViewDb {
             branch: vec!(ROOT_ORDER),
             docs: BTreeMap::new()
         }
+    }
+}
+
+impl ViewDb {
+    fn new() -> Self {
+        Self::default()
     }
 
     fn get_cloned(&self, key: &DocId) -> DbValue {
@@ -272,7 +307,7 @@ impl ViewDb {
     // TODO:
     // fn get_remote_value(&self, key: &DocId) ->
 
-    fn branch_as_versions(&self, ops: &OpDb) -> Vec<Version> {
+    fn branch_as_versions(&self, ops: &OpDb) -> Vec<LocalVersion> {
         self.branch.iter().map(|o| {
             ops.order_to_version(*o).clone()
         }).collect()
@@ -396,7 +431,8 @@ impl ViewDb {
 }
 
 
-#[derive(Debug)]
+
+#[derive(Debug, Default)]
 struct MemDb {
     op_db: OpDb,
     view: ViewDb,
@@ -404,10 +440,7 @@ struct MemDb {
 
 impl MemDb {
     fn new() -> Self {
-        MemDb {
-            op_db: OpDb::new(),
-            view: ViewDb::new()
-        }
+        Self::default()
     }
 
     fn apply_and_advance(&mut self, op: &RemoteOperation) -> Order {
@@ -436,18 +469,21 @@ fn main() -> io::Result<()> {
     println!("Db: {:?}", db);
     println!("Doc: {:?}", db.view.get_cloned(&"hi".to_string()));
 
-
+    let root_version = RemoteVersion {
+        agent: ROOT_AGENT_STR.to_string(),
+        seq: 0
+    };
     let op = RemoteOperation {
-        version: Version {
-            agent: 0,
+        version: RemoteVersion {
+            agent: "seph".to_string(),
             seq: 0
         },
         succeeds: None,
-        parents: vec!(ROOT_VERSION),
+        parents: vec!(root_version.clone()),
         doc_ops: vec!(RemoteDocOp {
             id: "hi".to_string(),
             patch: Blob("hi there".as_bytes().to_vec()),
-            parents: vec!(ROOT_VERSION)
+            parents: vec!(root_version.clone())
         })
     };
 
@@ -497,17 +533,19 @@ fn main() -> io::Result<()> {
             None => 0,
             Some(i) => i + 1
         };
-        let doc_succeeds: Vec<Version> = state.view.get_cloned(&key.to_string())
+        let doc_succeeds: Vec<RemoteVersion> = state.view.get_cloned(&key.to_string())
             .iter()
             .map(|v| v.order)
-            .map(|order| state.op_db.order_to_version(order))
-            .cloned()
+            .map(|order| state.op_db.order_to_remote_version(order))
             .collect();
-        let parents: Vec<Version> = state.view.branch.iter()
-            .map(|order| state.op_db.order_to_version(*order)).cloned().collect();
+        let parents: Vec<RemoteVersion> = state.view.branch.iter()
+            .map(|order| state.op_db.order_to_version(*order))
+            .map(|local| local.to_remote(&state.op_db.agent_map))
+            .collect();
 
+        let agent = "seph".to_string();
         let op = RemoteOperation {
-            version: Version { agent: 0, seq },
+            version: RemoteVersion { agent, seq },
             succeeds,
             parents,
             doc_ops: vec!(RemoteDocOp {
@@ -518,9 +556,12 @@ fn main() -> io::Result<()> {
         };
 
         let order = state.apply_and_advance(&op);
-        let version = state.op_db.order_to_version(order);
+        let version = state.op_db.order_to_remote_version(order);
 
-        Ok(Response::from("ok"))
+        Ok(Response::builder(StatusCode::Ok)
+            .header("version", version.encode())
+            .body("")
+            .build())
     });
 
     async_std::task::block_on(async {

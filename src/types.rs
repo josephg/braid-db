@@ -4,8 +4,14 @@ pub type Seq = u64;
 pub type DocId = String;
 pub type Agent = u32;
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct RemoteVersion {
+    pub agent: String,
+    pub seq: Seq
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct Version {
+pub struct LocalVersion {
     /** The agent is locally mapped from a string to a unique incrementing integer. */
     pub agent: Agent,
     pub seq: Seq
@@ -13,11 +19,11 @@ pub struct Version {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteOperation {
-    pub version: Version,
+    pub version: RemoteVersion,
     /** Usually version.seq - 1. This allows sparse versions. u64 max for first version. */
     pub succeeds: Option<Seq>,
 
-    pub parents: Vec<Version>,
+    pub parents: Vec<RemoteVersion>,
     pub doc_ops: Vec<RemoteDocOp>
 }
 
@@ -25,13 +31,13 @@ pub struct RemoteOperation {
 pub struct RemoteDocOp {
     pub id: DocId,
     pub patch: DocPatch,
-    pub parents: Vec<Version>,
+    pub parents: Vec<RemoteVersion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalOperation {
     pub order: Order,
-    pub version: Version,
+    pub version: LocalVersion,
     pub parents: Vec<Order>,
     pub doc_ops: Vec<LocalDocOp>,
 
