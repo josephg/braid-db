@@ -3,6 +3,7 @@ mod version;
 mod op_db;
 mod view_db;
 mod httpserver;
+mod readchannel;
 
 use crate::types::*;
 use crate::version::ROOT_AGENT_STR;

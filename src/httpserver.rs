@@ -1,9 +1,18 @@
 use crate::types::*;
 use crate::MemDb;
+use crate::readchannel::channel;
 
 use std::sync::Arc;
+
+use async_std::task;
 use async_std::sync::RwLock;
+use async_std::io::BufReader;
+
 use tide::{Request, Response, StatusCode};
+use tide::http::Body;
+
+use std::time::SystemTime;
+use chrono::DateTime;
 
 impl DocValue {
     fn to_bytes(&self) -> &[u8] {
@@ -14,11 +23,13 @@ impl DocValue {
     }
 }
 
+
 pub async fn host(db: MemDb) -> std::io::Result<()> {
+    type State = Arc<RwLock<MemDb>>;
     let state = Arc::new(RwLock::new(db));
 
     let mut app = tide::with_state(state);
-    app.at("/doc/:key").get(|req: Request<Arc<RwLock<MemDb>>>| async move {
+    app.at("/doc/:key").get(|req: Request<State>| async move {
         let key = req.param("key")?;
         let doc = req.state().read().await.view.get_cloned(&key.to_string());
         // println!("doc {:?}", doc);
@@ -33,7 +44,7 @@ pub async fn host(db: MemDb) -> std::io::Result<()> {
         }
     });
 
-    app.at("/doc/:key").put(|mut req: Request<Arc<RwLock<MemDb>>>| async move {
+    app.at("/doc/:key").put(|mut req: Request<State>| async move {
         let content = req.body_bytes().await?;
         let key = req.param("key")?;
 
@@ -74,6 +85,45 @@ pub async fn host(db: MemDb) -> std::io::Result<()> {
             .body("")
             .build())
     });
+
+    app.at("/test").get(|_| async move {
+        let mut res = Response::new(StatusCode::Ok);
+        res.insert_header("Subscribe", "keep-alive");
+
+        let (sender, reader) = channel();
+
+        task::spawn(async move {
+            loop {
+                let now = SystemTime::now();
+                let datetime: DateTime<chrono::Utc> = DateTime::from(now);
+                let date_str = datetime.to_rfc2822();
+
+                let bytes = date_str.as_bytes();
+                let content = format!("content-length: {}\r\n\r\n", bytes.len());
+                sender.send(content.into_bytes()).await.unwrap();
+                sender.send(bytes.to_vec()).await.unwrap();
+                async_std::task::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+
+        let mut res = Response::new(StatusCode::Ok);
+        res.insert_header("cache-control", "no-cache");
+        res.insert_header("connection", "keep-alive");
+        res.insert_header("content-type", "text/plain");
+
+        let body = Body::from_reader(BufReader::new(reader), None);
+        res.set_body(body);
+
+        Ok(res)
+    });
+
+    app.at("/sse").get(tide::sse::endpoint(|_req, sender| async move {
+        sender.send("", "oh hai", None).await?;
+        async_std::task::sleep(std::time::Duration::from_secs(2)).await;
+        sender.send("", "yooo", None).await?;
+
+        Ok(())
+    }));
 
     app.listen("0.0.0.0:4000").await
 }
